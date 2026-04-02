@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-dedupe.py — Deduplicate computer conversations.
+dedupe.py — Deduplicate classified conversations.
 Run: python -m scripts.dedupe
 """
 import json
 import re
-from collections import defaultdict
 from pathlib import Path
+from collections import defaultdict
 
 
 def canonicalize(text: str) -> str:
-    """Normalize text for comparison: lowercase, strip punct, normalize whitespace."""
+    """Normalize text for comparison."""
     if not text:
         return ""
     text = text.lower()
@@ -19,38 +19,25 @@ def canonicalize(text: str) -> str:
     return text
 
 
-def _score(conv: dict) -> tuple[int, int]:
-    """
-    Higher = better. Multi-turn conversations rank higher;
-    shorter human query ranks higher (more reusable/generalizable).
-    """
-    is_multi = 1 if conv.get("is_multi_turn") else 0
-    query = (conv.get("human_queries") or [""])[0] or ""
-    query_words = len(query.split()) if query else 999
-    return (is_multi, -query_words)
+def main():
+    base = Path(__file__).parent.parent
+    in_file = base / "data" / "classified.json"
+    out_file = base / "data" / "deduplicated.json"
 
-
-def deduplicate(conversations: list[dict]) -> tuple[list[dict], dict]:
-    """
-    Deduplicate in three passes:
-    1. Exact dedup  — identical (series, episode, computer_responses) tuple
-    2. Canonical dedup — same canonical response text; prefer multi-turn + shortest query
-    3. Boilerplate   — responses appearing >10 times across all episodes
-    """
+    data = json.loads(in_file.read_text())
+    print(f"Loaded {len(data)} classified conversations")
 
     # ----------------------------------------------------------------
-    # Pass 1: Exact dedup
+    # Pass 1: exact dedup — same episode + same primary computer response
     # ----------------------------------------------------------------
-    seen_exact: set[tuple] = set()
+    seen_exact = set()
     exact_filtered = []
     exact_dupes = 0
 
-    for conv in conversations:
-        key = (
-            conv["series"],
-            conv["episode"],
-            tuple(conv.get("computer_responses", [])),
-        )
+    for conv in data:
+        turns = conv.get("turns", [])
+        primary_response = turns[0].get("computer_response", "") if turns else ""
+        key = (conv["series"], conv["episode"], primary_response)
         if key not in seen_exact:
             seen_exact.add(key)
             exact_filtered.append(conv)
@@ -60,12 +47,14 @@ def deduplicate(conversations: list[dict]) -> tuple[list[dict], dict]:
     print(f"  Exact dedup: removed {exact_dupes}, kept {len(exact_filtered)}")
 
     # ----------------------------------------------------------------
-    # Pass 2: Canonical dedup
+    # Pass 2: canonical dedup — same canonical response text
+    #   Prefer: highest confidence, multi-turn, shortest query
     # ----------------------------------------------------------------
-    canonical_groups: dict[str, list[dict]] = defaultdict(list)
+    canonical_groups = defaultdict(list)
     for conv in exact_filtered:
-        resp = (conv.get("computer_responses") or [""])[0] or ""
-        key = canonicalize(resp)
+        turns = conv.get("turns", [])
+        primary_response = turns[0].get("computer_response", "") if turns else ""
+        key = canonicalize(primary_response)
         if key:
             canonical_groups[key].append(conv)
 
@@ -76,88 +65,79 @@ def deduplicate(conversations: list[dict]) -> tuple[list[dict], dict]:
         if len(group) == 1:
             canonical_filtered.append(group[0])
         else:
-            # Sort by score descending; keep first
-            group.sort(key=_score, reverse=True)
-            canonical_filtered.append(group[0])
+            scored = []
+            for idx, conv in enumerate(group):
+                conf = conv.get("intent_confidence", 0.0)
+                num_turns = len([t for t in conv.get("turns", []) if t.get("computer_response")])
+                query = conv.get("turns", [{}])[0].get("human_query", "") or ""
+                query_len = len(query.split())
+                score = (conf, num_turns, -query_len)
+                scored.append((score, idx, conv))
+
+            scored.sort(reverse=True)
+            canonical_filtered.append(scored[0][2])
             canonical_dupes += len(group) - 1
 
     print(f"  Canonical dedup: removed {canonical_dupes}, kept {len(canonical_filtered)}")
 
     # ----------------------------------------------------------------
-    # Pass 3: Boilerplate — response appears >10 times across all episodes
+    # Pass 3: boilerplate — responses appearing >10x across all episodes
     # ----------------------------------------------------------------
-    response_counts: dict[str, int] = defaultdict(int)
+    response_counts = defaultdict(int)
     for conv in canonical_filtered:
-        for resp in conv.get("computer_responses", []):
+        for turn in conv.get("turns", []):
+            resp = turn.get("computer_response", "")
             if resp:
                 response_counts[canonicalize(resp)] += 1
 
     boilerplate_keys = {k for k, v in response_counts.items() if v > 10}
+    boilerplate_filtered = [
+        c for c in canonical_filtered
+        if not any(
+            canonicalize(t.get("computer_response", "")) in boilerplate_keys
+            for t in c.get("turns", [])
+        )
+    ]
+    boilerplate_removed = len(canonical_filtered) - len(boilerplate_filtered)
 
-    boilerplate_filtered = []
-    boilerplate_removed = 0
-    for conv in canonical_filtered:
-        primary = canonicalize((conv.get("computer_responses") or [""])[0] or "")
-        if primary in boilerplate_keys:
-            boilerplate_removed += 1
-        else:
-            boilerplate_filtered.append(conv)
+    if boilerplate_removed:
+        boilerplate_list = [(k, v) for k, v in response_counts.items() if v > 10]
+        boilerplate_list.sort(key=lambda x: -x[1])
+        print(f"  Boilerplate: removed {boilerplate_removed}")
+        for bp, count in boilerplate_list[:5]:
+            print(f"    [{count}x] {bp[:60]}")
+    else:
+        print(f"  Boilerplate: none found")
 
-    print(
-        f"  Boilerplate (>{10}x): removed {boilerplate_removed},"
-        f" kept {len(boilerplate_filtered)}"
-    )
+    # Strip context and intent_raw for cleanliness
+    for conv in boilerplate_filtered:
+        conv.pop("context", None)
+        conv.pop("intent_raw", None)
+        for turn in conv.get("turns", []):
+            turn.pop("line_num", None)
+            turn.pop("raw", None)
 
-    result = {
-        "total_input": len(conversations),
-        "total_output": len(boilerplate_filtered),
+    stats = {
+        "input_total": len(data),
+        "output_total": len(boilerplate_filtered),
         "exact_dupes": exact_dupes,
         "canonical_dupes": canonical_dupes,
         "boilerplate_removed": boilerplate_removed,
-        "boilerplate_responses": [
-            (resp, count)
-            for resp, count in sorted(response_counts.items(), key=lambda x: -x[1])
-            if count > 10
-        ],
+        "boilerplate_threshold": 10,
+        "intent_distribution": {},
     }
-    return boilerplate_filtered, result
 
+    from collections import Counter
+    intent_dist = Counter(c.get("intent", "other") for c in boilerplate_filtered)
+    stats["intent_distribution"] = dict(intent_dist)
 
-def main():
-    classified_path = Path(__file__).parent.parent / "data" / "classified.json"
-    out_path = Path(__file__).parent.parent / "data" / "deduplicated.json"
+    output = {"stats": stats, "conversations": boilerplate_filtered}
+    out_file.write_text(json.dumps(output, indent=2))
 
-    data = json.loads(classified_path.read_text())
-    print(f"Loaded {len(data)} classified conversations")
-
-    # Strip full context (too large) and keep only what we need
-    stripped = []
-    for conv in data:
-        stripped.append(
-            {
-                "episode": conv["episode"],
-                "series": conv["series"],
-                "series_title": conv.get("series_title", conv["series"]),
-                "season": conv.get("season", 0),
-                "episode_num": conv.get("episode_num", 0),
-                "stardate": conv.get("stardate", ""),
-                "is_multi_turn": conv.get("is_multi_turn", False),
-                "num_human_turns": conv.get("num_human_turns", 0),
-                "num_computer_turns": conv.get("num_computer_turns", 0),
-                "intent": conv.get("intent", "UNKNOWN"),
-                "human_queries": conv.get("human_queries", []),
-                "computer_responses": conv.get("computer_responses", []),
-                "query": conv.get("query", {}),
-            }
-        )
-
-    cleaned, result = deduplicate(stripped)
-
-    out_path.write_text(json.dumps({"stats": result, "conversations": cleaned}, indent=2))
-    print(f"\nWrote {len(cleaned)} deduplicated conversations to {out_path}")
-    print(f"\nBoilerplate responses ({len(result['boilerplate_responses'])} total):")
-    for resp, count in result["boilerplate_responses"][:10]:
-        print(f"  [{count}x] {resp[:60]}")
+    print(f"\n  Total: {stats['output_total']} conversations (from {stats['input_total']})")
+    print(f"\nIntent distribution:")
+    for intent, count in sorted(intent_dist.items(), key=lambda x: -x[1]):
+        print(f"  {intent:25s} {count:4d}  ({100*count/len(boilerplate_filtered):.1f}%)")
 
 
 if __name__ == "__main__":
