@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-classify_llm.py — Classify ALL conversations via Zo LLM.
+classify_llm.py — Classify ALL conversations via OpenRouter LLM.
 Each conversation gets: intent, confidence, situation, computer_action, notable_phrase.
 Output: classified.json + fine_tune.jsonl
 """
@@ -8,6 +8,18 @@ import json, time, os, re
 from collections import Counter
 from pathlib import Path
 import urllib.request
+import urllib.error
+
+# Manual .env loader
+def load_dotenv():
+    env_path = Path(__file__).parent.parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            if "=" in line and not line.startswith("#"):
+                key, val = line.split("=", 1)
+                os.environ[key.strip()] = val.strip()
+
+load_dotenv()
 
 INTENTS = ["information_retrieval", "system_control", "warning_alert",
            "environmental", "holodeck", "medical", "navigation", "security", "other"]
@@ -24,8 +36,8 @@ SYSTEM = (
     "No markdown. No explanation. Only the JSON object."
 )
 
-MODEL = "vercel:minimax/minimax-m2.7"
-TOKEN = os.environ["ZO_CLIENT_IDENTITY_TOKEN"]
+MODEL = "google/gemini-2.0-flash-001"
+API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 def parse_llm_output(raw: str) -> dict | None:
     """Parse LLM JSON response with multiple fallback strategies."""
@@ -61,35 +73,56 @@ def parse_llm_output(raw: str) -> dict | None:
     }
 
 def classify(cr: str, hq: str, series: str, episode: str) -> dict:
-    prompt = (
-        f"{SYSTEM}\n\n"
+    if not API_KEY:
+        raise ValueError("OPENROUTER_API_KEY not found in environment or .env")
+
+    user_prompt = (
         f"Series: {series}\nEpisode: {episode}\n"
         f"Computer responses: \"{cr[:400]}\"\n"
         f"Human queries: \"{hq[:300]}\"\n\n"
         'Respond with ONLY a JSON object.'
     )
-    payload = json.dumps({"input": prompt, "model_name": MODEL}).encode()
-    headers = {
-        "Authorization": f"Bearer {TOKEN}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
+    
+    payload_data = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.0,
     }
+    
+    if "gemini" in MODEL.lower() or "gpt" in MODEL.lower():
+        payload_data["response_format"] = {"type": "json_object"}
+
+    payload = json.dumps(payload_data).encode()
+    
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/EthanThatOneKid/startrek-computer",
+        "X-Title": "Star Trek Computer Pipeline"
+    }
+    
     req = urllib.request.Request(
-        "https://api.zo.computer/zo/ask",
+        "https://openrouter.ai/api/v1/chat/completions",
         data=payload,
         headers=headers,
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        result = json.loads(resp.read())
-    raw = result.get("output", "")
-    parsed = parse_llm_output(raw)
-    if parsed:
-        return parsed
-    # Fallback: extract intent via regex from raw text
-    intent_found = next((i for i in INTENTS if i in raw.lower()), "other")
+    
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+        raw = result["choices"][0]["message"]["content"]
+        parsed = parse_llm_output(raw)
+        if parsed:
+            return parsed
+    except Exception as e:
+        print(f"  Error calling API: {e}")
+    
     return {
-        "intent": intent_found,
+        "intent": "other",
         "confidence": 0.0,
         "situation": "",
         "computer_action": "",
@@ -99,10 +132,31 @@ def classify(cr: str, hq: str, series: str, episode: str) -> dict:
 def main():
     start = time.time()
     base = Path(__file__).parent.parent
-    data = json.loads((base / "data" / "enriched.json").read_text())
+    data_path = base / "data" / "enriched.json"
+    data = json.loads(data_path.read_text())
     print(f"Loaded {len(data)} enriched conversations")
 
-    for i, conv in enumerate(data):
+    # Load existing classified data to resume/preserve
+    classified_path = base / "data" / "classified.json"
+    if classified_path.exists():
+        try:
+            old_data = json.loads(classified_path.read_text())
+            # Map by episode + line_num or index
+            # Simplest for now since we haven't filtered yet: index
+            for i, old_conv in enumerate(old_data):
+                if i < len(data):
+                    # Check if it already has rich LLM fields
+                    if old_conv.get("situation") and old_conv.get("intent_confidence", 0) > 0:
+                        data[i] = old_conv
+        except Exception as e:
+            print(f"  Warning: could not resume from existing file: {e}")
+
+    # Identify items needing classification
+    needs_reclass = [i for i, c in enumerate(data) if not c.get("situation")]
+    print(f"  Items needing LLM classification: {len(needs_reclass)}")
+
+    for count, i in enumerate(needs_reclass):
+        conv = data[i]
         turns = conv.get("turns", [])
         cr = turns[0].get("computer_response", "") if turns else ""
         hq = turns[0].get("human_query", "") if turns else ""
@@ -115,11 +169,15 @@ def main():
         conv["notable_phrase"] = result["notable_phrase"]
 
         elapsed_total = time.time() - start
-        rate = elapsed_total / (i + 1)
-        remaining = rate * (len(data) - i - 1)
-        print(f"  {i+1}/{len(data)} | {rate:.1f}s/call | ~{remaining/60:.0f}min | last=intent={result['intent']}")
+        rate = elapsed_total / (count + 1)
+        remaining = rate * (len(needs_reclass) - count - 1)
+        print(f"  {count+1}/{len(needs_reclass)} | {rate:.1f}s/call | ~{remaining/60:.0f}min | last=intent={result['intent']}")
 
-    (base / "data" / "classified.json").write_text(json.dumps(data, indent=2))
+        # Save checkpoint every 25 calls
+        if (count + 1) % 25 == 0:
+            classified_path.write_text(json.dumps(data, indent=2))
+
+    classified_path.write_text(json.dumps(data, indent=2))
     print(f"\nWrote {len(data)} classified -> data/classified.json")
 
     # Fine-tune JSONL
