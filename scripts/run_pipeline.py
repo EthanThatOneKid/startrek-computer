@@ -15,9 +15,9 @@ SCRIPTS = [
 ]
 
 
-def run(name: str, script: str) -> None:
+def run(script: str, description: str) -> None:
     print(f"\n{'='*60}")
-    print(f"  [{name}] {SCRIPTS[int(name[-1])-1][1]}")
+    print(f"  {description}")
     print(f"{'='*60}")
     result = subprocess.run([sys.executable, "-m", f"scripts.{script}"])
     if result.returncode != 0:
@@ -26,14 +26,8 @@ def run(name: str, script: str) -> None:
 
 
 def main():
-    steps = [
-        ("1_export",   "export_conversations"),
-        ("2_classify", "classify_llm"),
-        ("3_dedupe",   "dedupe"),
-        ("4_analyze",  "analyze"),
-    ]
-    for name, script in steps:
-        run(name, script)
+    for script, desc in SCRIPTS:
+        run(script, desc)
     print("\n✅ Pipeline complete!")
 
 

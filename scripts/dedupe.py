@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List
 from collections import defaultdict, Counter
 from pydantic import TypeAdapter
-from models.spec import Interaction, Dataset
+from models.spec import Interaction
 
 
 def canonicalize(text: str) -> str:

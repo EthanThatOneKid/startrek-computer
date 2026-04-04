@@ -7,13 +7,11 @@ Output: classified.json + fine_tune.jsonl
 import json, time, os, re, hashlib
 from collections import Counter
 from pathlib import Path
+from typing import List
 import urllib.request
 import urllib.error
 from pydantic import TypeAdapter
-from models.spec import (
-    Interaction, SceneContext, SpeechAct, Classification, 
-    Candidate, GroundingMetadata, GroundingSupport
-)
+from models.spec import Interaction, SpeechAct, Classification, Candidate
 
 # Manual .env loader
 def load_dotenv():
@@ -140,6 +138,8 @@ def generate_id(transcript: List[SpeechAct]) -> str:
     return hashlib.sha256(content.encode()).hexdigest()[:12]
 
 def main():
+    start = time.time()
+    base = Path(__file__).parent.parent
     # 1. Load data (v2 interactions)
     interactions_path = base / "data" / "interactions.json"
     if not interactions_path.exists():
