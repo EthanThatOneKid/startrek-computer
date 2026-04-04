@@ -3,10 +3,12 @@
 dedupe.py — Deduplicate classified conversations.
 Run: python -m scripts.dedupe
 """
-import json
-import re
+import json, re
 from pathlib import Path
-from collections import defaultdict
+from typing import List
+from collections import defaultdict, Counter
+from pydantic import TypeAdapter
+from models.spec import Interaction, Dataset
 
 
 def canonicalize(text: str) -> str:
@@ -21,11 +23,16 @@ def canonicalize(text: str) -> str:
 
 def main():
     base = Path(__file__).parent.parent
-    in_file = base / "data" / "classified.json"
-    out_file = base / "data" / "deduplicated.json"
+    in_file = base / "data" / "interactions.json"
+    out_file = base / "data" / "interactions_deduped.json"
 
-    data = json.loads(in_file.read_text())
-    print(f"Loaded {len(data)} classified conversations")
+    if not in_file.exists():
+        print(f"Error: {in_file} not found.")
+        return
+
+    adapter = TypeAdapter(List[Interaction])
+    data = adapter.validate_python(json.loads(in_file.read_text()))
+    print(f"Loaded {len(data)} interactions")
 
     # ----------------------------------------------------------------
     # Pass 1: exact dedup — same episode + same primary computer response
@@ -34,13 +41,12 @@ def main():
     exact_filtered = []
     exact_dupes = 0
 
-    for conv in data:
-        turns = conv.get("turns", [])
-        primary_response = turns[0].get("computer_response", "") if turns else ""
-        key = (conv["series"], conv["episode"], primary_response)
+    for interaction in data:
+        primary_response = interaction.candidates[0].content if interaction.candidates else ""
+        key = (interaction.context.series, interaction.context.episode, primary_response)
         if key not in seen_exact:
             seen_exact.add(key)
-            exact_filtered.append(conv)
+            exact_filtered.append(interaction)
         else:
             exact_dupes += 1
 
@@ -51,12 +57,11 @@ def main():
     #   Prefer: highest confidence, multi-turn, shortest query
     # ----------------------------------------------------------------
     canonical_groups = defaultdict(list)
-    for conv in exact_filtered:
-        turns = conv.get("turns", [])
-        primary_response = turns[0].get("computer_response", "") if turns else ""
+    for interaction in exact_filtered:
+        primary_response = interaction.candidates[0].content if interaction.candidates else ""
         key = canonicalize(primary_response)
         if key:
-            canonical_groups[key].append(conv)
+            canonical_groups[key].append(interaction)
 
     canonical_filtered = []
     canonical_dupes = 0
@@ -66,13 +71,14 @@ def main():
             canonical_filtered.append(group[0])
         else:
             scored = []
-            for idx, conv in enumerate(group):
-                conf = conv.get("intent_confidence", 0.0)
-                num_turns = len([t for t in conv.get("turns", []) if t.get("computer_response")])
-                query = conv.get("turns", [{}])[0].get("human_query", "") or ""
+            for idx, interaction in enumerate(group):
+                classification = interaction.candidates[0].classification
+                conf = classification.confidence
+                num_turns = interaction.num_computer_turns
+                query = interaction.transcript[0].text if interaction.transcript else ""
                 query_len = len(query.split())
                 score = (conf, num_turns, -query_len)
-                scored.append((score, idx, conv))
+                scored.append((score, idx, interaction))
 
             scored.sort(reverse=True)
             canonical_filtered.append(scored[0][2])
@@ -84,18 +90,18 @@ def main():
     # Pass 3: boilerplate — responses appearing >10x across all episodes
     # ----------------------------------------------------------------
     response_counts = defaultdict(int)
-    for conv in canonical_filtered:
-        for turn in conv.get("turns", []):
-            resp = turn.get("computer_response", "")
+    for interaction in canonical_filtered:
+        for candidate in interaction.candidates:
+            resp = candidate.content
             if resp:
                 response_counts[canonicalize(resp)] += 1
 
     boilerplate_keys = {k for k, v in response_counts.items() if v > 10}
     boilerplate_filtered = [
-        c for c in canonical_filtered
+        interaction for interaction in canonical_filtered
         if not any(
-            canonicalize(t.get("computer_response", "")) in boilerplate_keys
-            for t in c.get("turns", [])
+            canonicalize(candidate.content) in boilerplate_keys
+            for candidate in interaction.candidates
         )
     ]
     boilerplate_removed = len(canonical_filtered) - len(boilerplate_filtered)
@@ -109,14 +115,8 @@ def main():
     else:
         print(f"  Boilerplate: none found")
 
-    # Strip context and intent_raw for cleanliness
-    for conv in boilerplate_filtered:
-        conv.pop("context", None)
-        conv.pop("intent_raw", None)
-        for turn in conv.get("turns", []):
-            turn.pop("line_num", None)
-            turn.pop("raw", None)
-
+    # Note: We keep the Interaction model intact (no more popping fields)
+    
     stats = {
         "input_total": len(data),
         "output_total": len(boilerplate_filtered),
@@ -127,14 +127,13 @@ def main():
         "intent_distribution": {},
     }
 
-    from collections import Counter
-    intent_dist = Counter(c.get("intent", "other") for c in boilerplate_filtered)
+    intent_dist = Counter(interaction.candidates[0].classification.intent for interaction in boilerplate_filtered)
     stats["intent_distribution"] = dict(intent_dist)
 
-    output = {"stats": stats, "conversations": boilerplate_filtered}
-    out_file.write_text(json.dumps(output, indent=2))
+    # Save as interactions list
+    out_file.write_text(json.dumps([idx.model_dump() for idx in boilerplate_filtered], indent=2))
 
-    print(f"\n  Total: {stats['output_total']} conversations (from {stats['input_total']})")
+    print(f"\n  Total: {stats['output_total']} interactions (from {stats['input_total']})")
     print(f"\nIntent distribution:")
     for intent, count in sorted(intent_dist.items(), key=lambda x: -x[1]):
         print(f"  {intent:25s} {count:4d}  ({100*count/len(boilerplate_filtered):.1f}%)")

@@ -4,11 +4,16 @@ classify_llm.py — Classify ALL conversations via OpenRouter LLM.
 Each conversation gets: intent, confidence, situation, computer_action, notable_phrase.
 Output: classified.json + fine_tune.jsonl
 """
-import json, time, os, re
+import json, time, os, re, hashlib
 from collections import Counter
 from pathlib import Path
 import urllib.request
 import urllib.error
+from pydantic import TypeAdapter
+from models.spec import (
+    Interaction, SceneContext, SpeechAct, Classification, 
+    Candidate, GroundingMetadata, GroundingSupport
+)
 
 # Manual .env loader
 def load_dotenv():
@@ -121,87 +126,90 @@ def classify(cr: str, hq: str, series: str, episode: str) -> dict:
     except Exception as e:
         print(f"  Error calling API: {e}")
     
-    return {
-        "intent": "other",
-        "confidence": 0.0,
-        "situation": "",
-        "computer_action": "",
-        "notable_phrase": "",
-    }
+    return Classification(
+        intent=parsed.get("intent") or "other",
+        confidence=float(parsed.get("confidence") or 0.0),
+        situation=parsed.get("situation") or "",
+        computer_action=parsed.get("computer_action") or "",
+        notable_phrase=parsed.get("notable_phrase") or "",
+    )
+
+def generate_id(transcript: List[SpeechAct]) -> str:
+    """Generate a stable 12-char hash for the interaction."""
+    content = "|".join([f"{t.line_num}:{t.speaker}:{t.text}" for t in transcript])
+    return hashlib.sha256(content.encode()).hexdigest()[:12]
 
 def main():
-    start = time.time()
-    base = Path(__file__).parent.parent
-    data_path = base / "data" / "enriched.json"
-    data = json.loads(data_path.read_text())
-    print(f"Loaded {len(data)} enriched conversations")
-
-    # Load existing classified data to resume/preserve
-    classified_path = base / "data" / "classified.json"
-    if classified_path.exists():
-        try:
-            old_data = json.loads(classified_path.read_text())
-            # Map by episode + line_num or index
-            # Simplest for now since we haven't filtered yet: index
-            for i, old_conv in enumerate(old_data):
-                if i < len(data):
-                    # Check if it already has rich LLM fields
-                    if old_conv.get("situation") and old_conv.get("intent_confidence", 0) > 0:
-                        data[i] = old_conv
-        except Exception as e:
-            print(f"  Warning: could not resume from existing file: {e}")
+    # 1. Load data (v2 interactions)
+    interactions_path = base / "data" / "interactions.json"
+    if not interactions_path.exists():
+        print("interactions.json not found. Did you run migrate_v2.py?")
+        return
+    
+    adapter = TypeAdapter(List[Interaction])
+    interactions = adapter.validate_python(json.loads(interactions_path.read_text()))
+    print(f"Loaded {len(interactions)} interactions")
 
     # Identify items needing classification
-    needs_reclass = [i for i, c in enumerate(data) if not c.get("situation")]
+    needs_reclass = [i for i, interaction in enumerate(interactions) if not interaction.candidates[0].classification.situation]
     print(f"  Items needing LLM classification: {len(needs_reclass)}")
 
     for count, i in enumerate(needs_reclass):
-        conv = data[i]
-        turns = conv.get("turns", [])
-        cr = turns[0].get("computer_response", "") if turns else ""
-        hq = turns[0].get("human_query", "") if turns else ""
+        interaction = interactions[i]
+        
+        # Extract computer and human turns for classification prompt
+        comp_parts = [c.content for c in interaction.candidates]
+        human_parts = [t.text for t in interaction.transcript if not t.is_computer]
+        
+        cr = " ".join(comp_parts)
+        hq = " ".join(human_parts)
 
-        result = classify(cr, hq, conv.get("series", ""), conv.get("episode", ""))
-        conv["intent"] = result["intent"]
-        conv["intent_confidence"] = round(result["confidence"], 2)
-        conv["situation"] = result["situation"]
-        conv["computer_action"] = result["computer_action"]
-        conv["notable_phrase"] = result["notable_phrase"]
+        result = classify(cr, hq, interaction.context.series, interaction.context.episode)
+        
+        # Update all candidates with the classification (v1 style)
+        for candidate in interaction.candidates:
+            candidate.classification = result
 
         elapsed_total = time.time() - start
         rate = elapsed_total / (count + 1)
         remaining = rate * (len(needs_reclass) - count - 1)
-        print(f"  {count+1}/{len(needs_reclass)} | {rate:.1f}s/call | ~{remaining/60:.0f}min | last=intent={result['intent']}")
+        print(f"  {count+1}/{len(needs_reclass)} | {rate:.1f}s/call | ~{remaining/60:.0f}min | last=intent={result.intent}")
 
         # Save checkpoint every 25 calls
         if (count + 1) % 25 == 0:
-            classified_path.write_text(json.dumps(data, indent=2))
+            interactions_path.write_text(json.dumps([idx.model_dump() for idx in interactions], indent=2))
 
-    classified_path.write_text(json.dumps(data, indent=2))
-    print(f"\nWrote {len(data)} classified -> data/classified.json")
+    interactions_path.write_text(json.dumps([idx.model_dump() for idx in interactions], indent=2))
+    print(f"\nWrote {len(interactions)} interactions -> {interactions_path}")
 
     # Fine-tune JSONL
     ft_records = []
-    for conv in data:
-        for turn in conv.get("turns", []):
-            hq = turn.get("human_query", "").strip()
-            cr = turn.get("computer_response", "").strip()
-            if hq and cr:
-                ft_records.append(json.dumps({
-                    "messages": [
-                        {"role": "user", "content": hq},
-                        {"role": "assistant", "content": cr},
-                    ],
-                    "intent": conv.get("intent", "other"),
-                    "situation": conv.get("situation", ""),
-                }))
+    for interaction in interactions:
+        classification = interaction.candidates[0].classification
+        human_turns = [t.text for t in interaction.transcript if not t.is_computer]
+        comp_turns = [c.content for c in interaction.candidates]
+        
+        # Pair them up if possible, or just use the first of each
+        hq = human_turns[0] if human_turns else ""
+        cr = comp_turns[0] if comp_turns else ""
+        
+        if hq and cr:
+            ft_records.append(json.dumps({
+                "messages": [
+                    {"role": "user", "content": hq},
+                    {"role": "assistant", "content": cr},
+                ],
+                "intent": classification.intent,
+                "situation": classification.situation,
+            }))
+            
     (base / "data" / "fine_tune.jsonl").write_text("\n".join(ft_records))
     print(f"Wrote {len(ft_records)} fine-tune records -> data/fine_tune.jsonl")
 
-    intents = Counter(c.get("intent") for c in data)
+    intents = Counter(interaction.candidates[0].classification.intent for interaction in interactions)
     print("\nIntent distribution:")
     for intent, cnt in intents.most_common():
-        print(f"  {intent}: {cnt} ({100*cnt/len(data):.1f}%)")
+        print(f"  {intent}: {cnt} ({100*cnt/len(interactions):.1f}%)")
 
 if __name__ == "__main__":
     main()
