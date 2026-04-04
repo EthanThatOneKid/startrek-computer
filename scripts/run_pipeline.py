@@ -28,7 +28,7 @@ def run(script: str, description: str) -> None:
 def main():
     for script, desc in SCRIPTS:
         run(script, desc)
-    print("\n✅ Pipeline complete!")
+    print("\nDone Pipeline complete!")
 
 
 if __name__ == "__main__":
