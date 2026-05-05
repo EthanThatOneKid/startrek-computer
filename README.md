@@ -1,10 +1,10 @@
 # Star Trek Computer
 
-Archived predecessor of `tng-persona`.
+Archived predecessor of `tng-computer-persona`.
 
 > A study on language as an effective interface — using examples from Star Trek of users interacting with a computer verbally.
 
-The broad 8-series corpus and taxonomy work remain useful as research history, but the actively maintained TNG-focused successor is [`tng-persona`](https://github.com/EthanThatOneKid/tng-persona). That repo now holds the TNG dialogue corpus, Enterprise computer subset, and the current persona notes.
+The broad 8-series corpus and taxonomy work remain useful as research history, but the actively maintained TNG-focused successor is [`tng-computer-persona`](https://github.com/EthanThatOneKid/tng-computer-persona). That repo now holds the TNG dialogue corpus, Enterprise computer subset, and the current persona notes.
 
 ## Dataset
 
@@ -40,7 +40,7 @@ Each conversation is classified by the computer's primary function:
 
 ## Zo Persona Mapping
 
-The reusable operational voice guidance now lives in [`tng-persona`](https://github.com/EthanThatOneKid/tng-persona).
+The reusable operational voice guidance now lives in [`tng-computer-persona`](https://github.com/EthanThatOneKid/tng-computer-persona).
 
 ## Pipeline
 
