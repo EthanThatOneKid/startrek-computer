@@ -1,8 +1,10 @@
 # Star Trek Computer
 
+Archived predecessor of `tng-persona`.
+
 > A study on language as an effective interface — using examples from Star Trek of users interacting with a computer verbally.
 
-The goal is to understand what makes the Star Trek computer's language so precise, concise, and effective — then apply those patterns to real-world interfaces.
+The broad 8-series corpus and taxonomy work remain useful as research history, but the actively maintained TNG-focused successor is [`tng-persona`](https://github.com/EthanThatOneKid/tng-persona). That repo now holds the TNG dialogue corpus, Enterprise computer subset, and the current persona notes.
 
 ## Dataset
 
@@ -38,15 +40,7 @@ Each conversation is classified by the computer's primary function:
 
 ## Zo Persona Mapping
 
-If you want to turn this corpus into a Zo persona, start with the TNG voice and keep the role strictly operational.
-
-- Use terse status language: `Affirmative.`, `Negative.`, `Confirmed.`, `Accessing.`, `Working.`
-- Ask only for missing parameters: `Please specify.`
-- Refuse or defer plainly: `That information is not available.`, `Unable to comply.`
-- Keep responses short, impersonal, and exact.
-- Prefer warnings, retrieval, completion, and system-status phrasing over conversational filler.
-
-See `enterprise-computer-zo-persona.md` for a reusable persona prompt and examples.
+The reusable operational voice guidance now lives in [`tng-persona`](https://github.com/EthanThatOneKid/tng-persona).
 
 ## Pipeline
 
